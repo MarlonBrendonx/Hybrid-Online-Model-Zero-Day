@@ -1,10 +1,3 @@
-"""
-Pipeline Híbrido — Estudo de Ablação: REMOÇÃO DO DETECTOR C
-========================================================================
-Descrição: Detector A (Centroides) + Detector B (Entropia).
-Foco: Avaliar impacto da ausência do Detector C (ECOC) na detecção Zero-Day.
-"""
-
 import time
 import numpy as np
 import pandas as pd
