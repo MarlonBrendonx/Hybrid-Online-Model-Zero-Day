@@ -1,22 +1,24 @@
-"""
-Pipeline Híbrido — Estudo de Ablação: REMOÇÃO DO DETECTOR C
-========================================================================
-Descrição: Detector A (Centroides) + Detector B (Entropia).
-Foco: Avaliar impacto da ausência do Detector C (ECOC) na detecção Zero-Day.
-"""
-
 import time
 import numpy as np
 import pandas as pd
 import concurrent.futures
 import os
 from collections import defaultdict, deque
-import csv
 
 from river import anomaly, compose, preprocessing, ensemble, tree
-from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, StandardScaler
+from sklearn.preprocessing import (
+    LabelEncoder,
+    OrdinalEncoder,
+    StandardScaler,
+    MinMaxScaler,
+)
 from sklearn.metrics import classification_report, f1_score
-from sklearn.model_selection import train_test_split
+
+
+def log(msg: str, prefix: str = ""):
+    ts = time.strftime("%H:%M:%S")
+    tag = f"[{prefix}] " if prefix else ""
+    print(f"[{ts}] {tag}{msg}", flush=True)
 
 
 class ConservativeAutoLabeler:
@@ -31,24 +33,18 @@ class ConservativeAutoLabeler:
         self.history_window = history_window
         self.min_history_count = min_history_count
         self.ZERO_DAY = zero_day_label
-
         self._recent_accepted: deque = deque(maxlen=history_window)
         self.stats = {"accepted": 0, "rejected": 0}
 
     def evaluate(
-        self,
-        predicted_cls: int,
-        pred_a: int,
-        pred_b: int,
-        probas: dict,
+        self, predicted_cls: int, pred_a: int, pred_b: int, probas: dict
     ) -> int | None:
-        # Agora avalia apenas concordância entre A e B
         predictions = {pred_a, pred_b}
         if len(predictions) != 1:
             self.stats["rejected"] += 1
             return None
-
         agreed_cls = pred_a
+
         if agreed_cls == self.ZERO_DAY:
             self.stats["rejected"] += 1
             return None
@@ -81,8 +77,8 @@ class CentroidOSR:
     def _dist(self, x: np.ndarray, cls: int) -> float:
         if cls not in self.mean:
             return float("inf")
-        std = np.sqrt(self.M2[cls] / max(self.n[cls] - 1, 1))
-        std = np.where(std < 1e-9, 1e-9, std)
+        var = self.M2[cls] / max(self.n[cls] - 1, 1)
+        std = np.sqrt(np.where(var < 1e-9, 1e-9, var))
         return float(np.mean(np.abs(x - self.mean[cls]) / std))
 
     def learn_one(self, x: np.ndarray, cls: int):
@@ -90,8 +86,7 @@ class CentroidOSR:
             self.n[cls] = 0
             self.mean[cls] = np.zeros_like(x, dtype=float)
             self.M2[cls] = np.zeros_like(x, dtype=float)
-            self._intra[cls] = []
-            self._inter[cls] = []
+            self._intra[cls], self._inter[cls] = [], []
         self.n[cls] += 1
         delta = x - self.mean[cls]
         self.mean[cls] += delta / self.n[cls]
@@ -112,9 +107,7 @@ class CentroidOSR:
                 )
                 continue
             candidates = np.linspace(
-                min(intra.min(), inter.min()),
-                max(intra.max(), inter.max()),
-                400,
+                min(intra.min(), inter.min()), max(intra.max(), inter.max()), 400
             )
             best_youden, best_thr = -np.inf, candidates[-1]
             for t in candidates:
@@ -158,14 +151,9 @@ class EntropyOSR:
 
 class PrequentialSelector:
     def __init__(
-        self,
-        window_size: int = 200,
-        zero_day_label: int = 9,
-        min_samples: int = 30,
+        self, window_size: int = 200, zero_day_label: int = 9, min_samples: int = 30
     ):
-        self.window_size = window_size
-        self.ZERO_DAY = zero_day_label
-        self.min_samples = min_samples
+        self.ZERO_DAY, self.min_samples = zero_day_label, min_samples
         self.windows: dict = defaultdict(
             lambda: {d: deque(maxlen=window_size) for d in ("A", "B")}
         )
@@ -177,63 +165,117 @@ class PrequentialSelector:
 
     def select(self, predicted_cls: int) -> str:
         w = self.windows[predicted_cls]
-        # Se não houver dados suficientes, começa com B (Entropia) como padrão
         if len(w["B"]) < self.min_samples:
             return "B"
-
-        best_detector, best_f1 = "B", -1.0
+        best_det, best_f1 = "B", -1.0
         for det, window in w.items():
             if len(window) < self.min_samples:
                 continue
-            y_t = [s[0] for s in window]
-            y_p = [s[1] for s in window]
+            y_t, y_p = [s[0] for s in window], [s[1] for s in window]
             try:
                 f1 = f1_score(
                     y_t, y_p, labels=[self.ZERO_DAY], average="macro", zero_division=0
                 )
-            except Exception:
+            except:
                 f1 = 0.0
             if f1 > best_f1:
-                best_f1, best_detector = f1, det
-        return best_detector
+                best_f1, best_det = f1, det
+        return best_det
 
 
 def run_experiment(
     zero_day_class: int,
-    X_proc: pd.DataFrame,
+    X_raw: pd.DataFrame,
     y_true: np.ndarray,
-    feature_names: list,
+    numeric_cols: list,
+    categ_cols: list,
     le_classes: np.ndarray,
     normal_class: int,
 ):
     zd_name = le_classes[zero_day_class]
-    ZERO_DAY_LABEL = 9
+    prefix = zd_name  # usado em todos os logs deste processo
+
+    ZERO_DAY_LABEL, NORMAL_CLASS = 9, normal_class
     ZERO_DAY_CLASSES = [zero_day_class]
     KNOWN_CLASSES = [c for c in range(len(le_classes)) if c not in ZERO_DAY_CLASSES]
-    NORMAL_CLASS = normal_class
+
+    labels_eval = KNOWN_CLASSES + [ZERO_DAY_LABEL]
+    target_names = [f"class_{c}" for c in KNOWN_CLASSES] + ["zero_day"]
+
+    log("Dividindo índices train/test/zero-day…", prefix)
 
     mask_known = ~np.isin(y_true, ZERO_DAY_CLASSES)
-    X_zd = X_proc[np.isin(y_true, ZERO_DAY_CLASSES)]
-    y_zd = y_true[np.isin(y_true, ZERO_DAY_CLASSES)]
+    idx_known, idx_zd = np.where(mask_known)[0], np.where(~mask_known)[0]
+    split_point = int(len(idx_known) * 0.90)
+    train_idx, test_idx = idx_known[:split_point], idx_known[split_point:]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_proc[mask_known],
-        y_true[mask_known],
-        test_size=0.1,
-        random_state=42,
-        stratify=y_true[mask_known],
-    )
+    X_train_raw, y_train = X_raw.iloc[train_idx].copy(), y_true[train_idx]
+    X_test_raw, y_test = X_raw.iloc[test_idx].copy(), y_true[test_idx]
+    X_zd_raw, y_zd = X_raw.iloc[idx_zd].copy(), y_true[idx_zd]
+
     _, counts = np.unique(y_test, return_counts=True)
-    X_zd_sample = X_zd.iloc[: max(counts)]
-    y_zd_sample = y_zd[: max(counts)]
+    max_test_count = max(counts) if len(counts) > 0 else len(y_test)
+    X_zd_raw, y_zd_sample = X_zd_raw.iloc[:max_test_count], y_zd[:max_test_count]
 
-    X_train_arr = X_train.reset_index(drop=True).values
-    X_test_arr = X_test.reset_index(drop=True).values
+    log(
+        f"  train={len(train_idx)} | test={len(test_idx)} | zero-day={len(y_zd_sample)}",
+        prefix,
+    )
+
+    log("Pré-processando features (OrdinalEncoder)…", prefix)
+    if categ_cols:
+        oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+        X_tr_cat = X_train_raw[categ_cols].fillna("##MISSING##").astype(str)
+        X_te_cat = X_test_raw[categ_cols].fillna("##MISSING##").astype(str)
+        X_z_cat = X_zd_raw[categ_cols].fillna("##MISSING##").astype(str)
+        X_train_proc = pd.concat(
+            [
+                X_train_raw[numeric_cols],
+                pd.DataFrame(
+                    oe.fit_transform(X_tr_cat),
+                    columns=categ_cols,
+                    index=X_train_raw.index,
+                ),
+            ],
+            axis=1,
+        )
+        X_test_proc = pd.concat(
+            [
+                X_test_raw[numeric_cols],
+                pd.DataFrame(
+                    oe.transform(X_te_cat), columns=categ_cols, index=X_test_raw.index
+                ),
+            ],
+            axis=1,
+        )
+        X_zd_proc = pd.concat(
+            [
+                X_zd_raw[numeric_cols],
+                pd.DataFrame(
+                    oe.transform(X_z_cat), columns=categ_cols, index=X_zd_raw.index
+                ),
+            ],
+            axis=1,
+        )
+    else:
+        X_train_proc, X_test_proc, X_zd_proc = (
+            X_train_raw[numeric_cols],
+            X_test_raw[numeric_cols],
+            X_zd_raw[numeric_cols],
+        )
+
+    feature_names = X_train_proc.columns.tolist()
+    X_train_arr = X_train_proc.values
+    X_test_arr = X_test_proc.values
+    X_zd_arr = X_zd_proc.values
+
+    log("Inicializando HST, AdaBoost, OSR-A/B, Selector…", prefix)
 
     hst = compose.Pipeline(
-        preprocessing.MinMaxScaler(),
+        preprocessing.StandardScaler(),
         anomaly.HalfSpaceTrees(n_trees=10, height=11, window_size=100, seed=42),
     )
+
     clf = compose.Pipeline(
         preprocessing.StandardScaler(),
         ensemble.AdaBoostClassifier(
@@ -242,13 +284,17 @@ def run_experiment(
             seed=42,
         ),
     )
-    osr_a = CentroidOSR()
-    osr_scaler = StandardScaler()
-    osr_b = EntropyOSR(window_size=2000)
+
+    osr_a, osr_scaler, osr_b = (
+        CentroidOSR(),
+        StandardScaler(),
+        EntropyOSR(window_size=2000),
+    )
 
     selector = PrequentialSelector(
         window_size=200, zero_day_label=ZERO_DAY_LABEL, min_samples=30
     )
+
     auto_labeler = ConservativeAutoLabeler(
         confidence_threshold=0.90,
         history_window=50,
@@ -256,27 +302,43 @@ def run_experiment(
         zero_day_label=ZERO_DAY_LABEL,
     )
 
+    n_normal = int((y_train == NORMAL_CLASS).sum())
+
+    log(f"Warm-up HST com {n_normal} amostras normais…", prefix)
+
     for x_row in X_train_arr[y_train == NORMAL_CLASS]:
-        xi = {feature_names[j]: x_row[j] for j in range(len(x_row))}
-        hst.learn_one(xi)
+        hst.learn_one({feature_names[j]: x_row[j] for j in range(len(x_row))})
+
+    log(f"Calculando scores HST no treino ({len(X_train_arr)} amostras)…", prefix)
 
     scores_train, labels_binary = [], []
+
     for i, x_row in enumerate(X_train_arr):
         xi = {feature_names[j]: x_row[j] for j in range(len(x_row))}
         scores_train.append(hst.score_one(xi))
         labels_binary.append(0 if y_train[i] == NORMAL_CLASS else 1)
 
     scores_arr = np.array(scores_train)
-    labels_arr = np.array(labels_binary)
     thr_cands = np.linspace(scores_arr.min(), scores_arr.max(), 300)
-    f1s = [
-        f1_score(labels_arr, (scores_arr > t).astype(int), zero_division=0)
-        for t in thr_cands
-    ]
-    hst_threshold = float(thr_cands[np.argmax(f1s)])
+    hst_threshold = float(
+        thr_cands[
+            np.argmax(
+                [
+                    f1_score(
+                        np.array(labels_binary),
+                        (scores_arr > t).astype(int),
+                        zero_division=0,
+                    )
+                    for t in thr_cands
+                ]
+            )
+        ]
+    )
+    log(f"Limiar HST calibrado: {hst_threshold:.6f}", prefix)
+
+    log(f"Treinando clf + OSR online ({len(X_train_arr)} amostras)…", prefix)
 
     osr_scaler.fit(X_train_arr[y_train != NORMAL_CLASS])
-
     for i, x_row in enumerate(X_train_arr):
         xi = {feature_names[j]: x_row[j] for j in range(len(x_row))}
         cls = y_train[i]
@@ -284,35 +346,39 @@ def run_experiment(
         if cls != NORMAL_CLASS:
             x_sc = osr_scaler.transform(x_row.reshape(1, -1))[0]
             osr_a.learn_one(x_sc, cls)
-            probas = clf.predict_proba_one(xi)
-            if probas:
+            if probas := clf.predict_proba_one(xi):
                 osr_b.learn_one(probas)
 
+    log("Calibrando OSR-A (CentroidOSR)…", prefix)
     osr_a.calibrate()
+
+    log("Calibrando OSR-B (EntropyOSR)…", prefix)
     osr_b.calibrate()
 
     X_full = pd.concat(
-        [pd.DataFrame(X_test_arr, columns=X_proc.columns), X_zd_sample], axis=0
+        [pd.DataFrame(X_test_arr), pd.DataFrame(X_zd_arr)], axis=0
     ).reset_index(drop=True)
     y_full_arr = np.concatenate([y_test, y_zd_sample])
+    n_total = len(y_full_arr)
 
-    hybrid_true, hybrid_pred = [], []
-    total_ns = 0
-    n_samples = 0
+    log(f"Iniciando avaliação híbrida ({n_total} amostras)…", prefix)
+    hybrid_true, hybrid_pred, total_ns, n_samples = [], [], 0, 0
     detector_usage = defaultdict(int)
     autolabel_counts = {"accepted": 0, "rejected": 0}
+    expert_queue = deque(maxlen=100)
 
-    RECALIB_A_INTERVAL = 100
-    samples_since_recalib_a = 0
+    LOG_STEPS = max(1, n_total // 5)
 
     for i, x_row in enumerate(X_full.values):
+        if i > 0 and i % LOG_STEPS == 0:
+            pct = 100 * i // n_total
+            log(f"  progresso avaliação híbrida: {pct}% ({i}/{n_total})", prefix)
+
         t0 = time.time_ns()
         xi = {feature_names[j]: x_row[j] for j in range(len(x_row))}
         y_full = y_full_arr[i]
         y_bin = 0 if y_full == NORMAL_CLASS else 1
-
-        hst_score = hst.score_one(xi)
-        predicted_bin = 1 if hst_score > hst_threshold else 0
+        predicted_bin = 1 if hst.score_one(xi) > hst_threshold else 0
 
         if predicted_bin == 1 and y_bin == 1:
             predicted_cls = clf.predict_one(xi)
@@ -320,63 +386,30 @@ def run_experiment(
             x_sc = osr_scaler.transform(x_row.reshape(1, -1))[0]
 
             if predicted_cls == NORMAL_CLASS:
-                final_pred = ZERO_DAY_LABEL
-                pred_a = pred_b = ZERO_DAY_LABEL
+                final_pred = pred_a = pred_b = ZERO_DAY_LABEL
                 total_ns += time.time_ns() - t0
             else:
                 det = selector.select(predicted_cls)
                 detector_usage[det] += 1
-
-                # Executa o detector selecionado para a predição final
-                if det == "A":
-                    pred_a = (
-                        ZERO_DAY_LABEL
-                        if osr_a.is_zero_day(x_sc, predicted_cls)
-                        else predicted_cls
-                    )
-                    final_pred = pred_a
-                else:
-                    pred_b = (
-                        ZERO_DAY_LABEL
-                        if (probas and osr_b.is_zero_day(probas))
-                        else predicted_cls
-                    )
-                    final_pred = pred_b
-
+                pred_a = (
+                    ZERO_DAY_LABEL
+                    if osr_a.is_zero_day(x_sc, predicted_cls)
+                    else predicted_cls
+                )
+                pred_b = (
+                    ZERO_DAY_LABEL
+                    if (probas and osr_b.is_zero_day(probas))
+                    else predicted_cls
+                )
+                final_pred = {"A": pred_a, "B": pred_b}[det]
                 total_ns += time.time_ns() - t0
 
-                # Calcula o outro para fins de Auto-Rotulação e Selector
-                if det != "A":
-                    pred_a = (
-                        ZERO_DAY_LABEL
-                        if osr_a.is_zero_day(x_sc, predicted_cls)
-                        else predicted_cls
-                    )
-                if det != "B":
-                    pred_b = (
-                        ZERO_DAY_LABEL
-                        if (probas and osr_b.is_zero_day(probas))
-                        else predicted_cls
-                    )
-
-                auto_cls = auto_labeler.evaluate(
-                    predicted_cls=predicted_cls,
-                    pred_a=pred_a,
-                    pred_b=pred_b,
-                    probas=probas,
-                )
-
-                if auto_cls is not None and auto_cls != NORMAL_CLASS:
+                if auto_cls := auto_labeler.evaluate(
+                    predicted_cls, pred_a, pred_b, probas
+                ):
                     autolabel_counts["accepted"] += 1
                     osr_a.learn_one(x_sc, auto_cls)
-                    samples_since_recalib_a += 1
-                    if samples_since_recalib_a >= RECALIB_A_INTERVAL:
-                        osr_a.calibrate()
-                        samples_since_recalib_a = 0
-
-                    if probas:
-                        osr_b.learn_one(probas)
-
+                    osr_b.learn_one(probas)
                     clf.learn_one(xi, auto_cls)
                     hst.learn_one(xi)
                 else:
@@ -387,38 +420,36 @@ def run_experiment(
             hybrid_pred.append(final_pred)
 
             if predicted_cls != NORMAL_CLASS:
-                selector.update(predicted_cls, y_true_mapped, pred_a, pred_b)
+                expert_queue.append((predicted_cls, y_true_mapped, pred_a, pred_b))
+                if len(expert_queue) == 100:
+                    p_p, p_t, p_a, p_b = expert_queue.popleft()
+                    selector.update(p_p, p_t, p_a, p_b)
         else:
             total_ns += time.time_ns() - t0
-
         n_samples += 1
 
-    avg_latency_us = (total_ns / max(n_samples, 1)) / 1_000
-    labels_eval = KNOWN_CLASSES + [ZERO_DAY_LABEL]
-    target_names = [f"class_{c}" for c in KNOWN_CLASSES] + ["zero_day"]
+    log(
+        f"Avaliação híbrida concluída. AutoLabel aceitos={autolabel_counts['accepted']} "
+        f"| rejeitados={autolabel_counts['rejected']} "
+        f"| detector_uso={dict(detector_usage)}",
+        prefix,
+    )
 
-    # Métricas Híbrido
-    f1_hybrid_zd = 0.0
-    f1_hybrid_known = 0.0
-    f1_hybrid_macro = 0.0
-
-    if hybrid_true:
-        report = classification_report(
+    log("Calculando F1 híbrido…", prefix)
+    f1_hybrid = (
+        classification_report(
             hybrid_true,
             hybrid_pred,
             labels=labels_eval,
             target_names=target_names,
             zero_division=0,
             output_dict=True,
-        )
-        f1_hybrid_zd = report["zero_day"]["f1-score"]
-        known_f1s = [
-            report[tgt]["f1-score"] for tgt in target_names if tgt != "zero_day"
-        ]
-        f1_hybrid_known = np.mean(known_f1s)
-        f1_hybrid_macro = report["macro avg"]["f1-score"]
+        )["zero_day"]["f1-score"]
+        if hybrid_true
+        else 0.0
+    )
 
-    # Baseline (Idêntico ao original)
+    log("Treinando e avaliando baseline AdaBoost…", prefix)
     bl = compose.Pipeline(
         preprocessing.StandardScaler(),
         ensemble.AdaBoostClassifier(
@@ -428,144 +459,139 @@ def run_experiment(
         ),
     )
     for i, x_row in enumerate(X_train_arr):
-        xi = {feature_names[j]: x_row[j] for j in range(len(x_row))}
-        bl.learn_one(xi, y_train[i])
+        bl.learn_one(
+            {feature_names[j]: x_row[j] for j in range(len(x_row))}, y_train[i]
+        )
 
-    bl_true, bl_pred, bl_ns, bl_n = [], [], 0, 0
+    bl_true, bl_pred, bl_ns = [], [], 0
     for i, x_row in enumerate(X_full.values):
         t0 = time.time_ns()
         xi = {feature_names[j]: x_row[j] for j in range(len(x_row))}
         pred = bl.predict_one(xi)
         probas = bl.predict_proba_one(xi)
-        mc = max(probas.values()) if probas else 0
-        fp = ZERO_DAY_LABEL if mc < 0.70 else pred
+        fp = ZERO_DAY_LABEL if (max(probas.values()) if probas else 0) < 0.70 else pred
         bl_ns += time.time_ns() - t0
-        bl_n += 1
-        yf = y_full_arr[i]
-        bl_true.append(ZERO_DAY_LABEL if yf in ZERO_DAY_CLASSES else yf)
+        bl_true.append(
+            ZERO_DAY_LABEL if y_full_arr[i] in ZERO_DAY_CLASSES else y_full_arr[i]
+        )
         bl_pred.append(fp)
 
-    bl_latency_us = (bl_ns / max(bl_n, 1)) / 1_000
-    report_bl = classification_report(
+    f1_baseline = classification_report(
         bl_true,
         bl_pred,
         labels=labels_eval,
         target_names=target_names,
         zero_division=0,
         output_dict=True,
-    )
-    f1_bl_zd = report_bl["zero_day"]["f1-score"]
-    known_f1s_bl = [
-        report_bl[tgt]["f1-score"] for tgt in target_names if tgt != "zero_day"
-    ]
-    f1_bl_known = np.mean(known_f1s_bl)
-    f1_bl_macro = report_bl["macro avg"]["f1-score"]
+    )["zero_day"]["f1-score"]
 
-    accept_rate = autolabel_counts["accepted"] / max(
-        autolabel_counts["accepted"] + autolabel_counts["rejected"], 1
-    )
-    det_str = " ".join(f"{k}:{v}" for k, v in sorted(detector_usage.items()))
-
-    print(
-        f"[ZD:{zd_name:<22}] Híb ZD:{f1_hybrid_zd:.4f} (Knw:{f1_hybrid_known:.4f}) | Bas ZD:{f1_bl_zd:.4f} (Knw:{f1_bl_known:.4f}) | Δ_ZD:{f1_hybrid_zd - f1_bl_zd:+.4f} | AL:{accept_rate:.1%} | det:[{det_str}]"
+    log(
+        f"CONCLUÍDO — Hybrid_F1={f1_hybrid:.4f} | Baseline_F1={f1_baseline:.4f} "
+        f"| Delta={f1_hybrid - f1_baseline:+.4f}",
+        prefix,
     )
 
     return {
         "Zero_Day_Class": zd_name,
-        "Hybrid_F1_ZD": f1_hybrid_zd,
-        "Baseline_F1_ZD": f1_bl_zd,
-        "Delta_F1_ZD": f1_hybrid_zd - f1_bl_zd,
-        "Hybrid_F1_Known": f1_hybrid_known,
-        "Baseline_F1_Known": f1_bl_known,
-        "Hybrid_F1_Macro": f1_hybrid_macro,
-        "Baseline_F1_Macro": f1_bl_macro,
-        "Hybrid_Latency_us": avg_latency_us,
-        "Baseline_Latency_us": bl_latency_us,
-        "AutoLabel_AcceptRate": accept_rate,
+        "Hybrid_F1": f1_hybrid,
+        "Baseline_F1": f1_baseline,
+        "Delta_F1": f1_hybrid - f1_baseline,
+        "Hybrid_Latency_us": (total_ns / n_samples) / 1000,
+        "Baseline_Latency_us": (bl_ns / n_samples) / 1000,
+        "AutoLabel_AcceptRate": autolabel_counts["accepted"]
+        / max(autolabel_counts["accepted"] + autolabel_counts["rejected"], 1),
     }
 
 
 if __name__ == "__main__":
     NORMAL_CLASS = -1
-    print("Iniciando Pipeline Híbrido\n")
+    log("Iniciando experimento…")
 
-    with open(
-        "../../ML-EdgeIIoT-dataset-CLEANED.csv", "r", encoding="utf-8", errors="replace"
-    ) as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        dados = [row for row in reader]
-
-    df = pd.DataFrame(dados, columns=header)
-    TARGET_COL = "Attack_type"
-
-    # for col in df.columns:
-    #     if col != TARGET_COL:
-    #         df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = (
-        df.groupby(TARGET_COL)
-        .apply(lambda x: x.sample(min(len(x), 20_000), random_state=42))
-        .reset_index(drop=True)
+    path = (
+        "./ML_EdgeIIoT_SMOTE.csv"
+        if os.path.exists("./ML_EdgeIIoT_SMOTE.csv")
+        else "./ERENO-2.0-100K.csv"
     )
-    if "Time" in df.columns:
-        df = df.sort_values(by="Time").reset_index(drop=True)
+    log(f"Carregando dataset: {path}")
 
-    y_raw = df[TARGET_COL].astype(str)
-    X_raw = df.drop(columns=[TARGET_COL])
+    df = pd.read_csv(path, low_memory=False)
+    TARGET_COL = "Attack_type" if "Attack_type" in df.columns else "class"
+    df = df.dropna(subset=[TARGET_COL])
+    log(f"Dataset carregado: {len(df)} linhas, {len(df.columns)} colunas.")
 
-    le = LabelEncoder()
-    y_true = le.fit_transform(y_raw)
-    for i, cls_name in enumerate(le.classes_):
-        if cls_name.lower() == "normal":
-            NORMAL_CLASS = i
-
+    y_raw, X_raw = df[TARGET_COL].astype(str), df.drop(columns=[TARGET_COL])
     numeric_cols = X_raw.select_dtypes(include=[np.number]).columns.tolist()
     categ_cols = X_raw.select_dtypes(exclude=[np.number]).columns.tolist()
 
-    oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-    X_cat_enc = pd.DataFrame(
-        oe.fit_transform(X_raw[categ_cols].fillna("##MISSING##")),
-        columns=categ_cols,
-        index=X_raw.index,
-    )
-    X_proc = pd.concat([X_raw[numeric_cols], X_cat_enc], axis=1)
-    feature_names = X_proc.columns.tolist()
+    constant_cols = [col for col in numeric_cols if X_raw[col].nunique() <= 1]
+    if constant_cols:
+        log(f"Removendo {len(constant_cols)} colunas constantes.")
+        X_raw = X_raw.drop(columns=constant_cols)
+        numeric_cols = [c for c in numeric_cols if c not in constant_cols]
+
+    log("Aplicando log1p em colunas numéricas skewed…")
+    for col in numeric_cols:
+        if X_raw[col].min() >= 0 and X_raw[col].max() > 1000:
+            X_raw[col] = np.log1p(X_raw[col])
+
+    X_raw = X_raw.replace([np.inf, -np.inf], np.nan).fillna(0)
+    X_raw[numeric_cols] = X_raw[numeric_cols].clip(lower=-1e6, upper=1e6)
+
+    le = LabelEncoder()
+    y_true = le.fit_transform(y_raw)
+    for i, name in enumerate(le.classes_):
+        if name.lower() == "normal":
+            NORMAL_CLASS = i
 
     classes_to_test = [c for c in range(len(le.classes_)) if c != NORMAL_CLASS]
-    results = []
+    log(
+        f"Dataset: {path} | Normal class idx={NORMAL_CLASS} | "
+        f"Classes a testar: {len(classes_to_test)}"
+    )
+    log(f"Classes: {list(le.classes_)}")
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=10) as executor:
+    results = []
+    n_workers = max(1, os.cpu_count() - 2)
+    log(f"Disparando ProcessPoolExecutor com {n_workers} workers…")
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = {
             executor.submit(
                 run_experiment,
                 zd,
-                X_proc,
+                X_raw,
                 y_true,
-                feature_names,
+                numeric_cols,
+                categ_cols,
                 le.classes_,
                 NORMAL_CLASS,
             ): zd
             for zd in classes_to_test
         }
-        for future in concurrent.futures.as_completed(futures):
+        done_count = 0
+        for f in concurrent.futures.as_completed(futures):
             try:
-                results.append(future.result())
-            except Exception as exc:
-                print(f"Erro: {exc}")
+                res = f.result()
+                results.append(res)
+                done_count += 1
+                log(
+                    f"[{done_count}/{len(classes_to_test)}] Concluído: "
+                    f"{res['Zero_Day_Class']} | F1={res['Hybrid_F1']:.4f} | "
+                    f"Delta={res['Delta_F1']:+.4f}"
+                )
+            except Exception as e:
+                done_count += 1
+                log(f"[{done_count}/{len(classes_to_test)}] ERRO: {e}")
 
-    SEP = "=" * 85
-    print(f"\n{SEP}\nRESULTADO — Pipeline Híbrido\n{SEP}")
+    if results:
+        SEP = "=" * 76
+        df_r = pd.DataFrame(results).sort_values("Zero_Day_Class")
+        log("Todos os experimentos finalizados. Exibindo resumo…")
 
-    df_r = pd.DataFrame(results).sort_values("Zero_Day_Class")
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 1000)
-
-    print(df_r.to_string(index=False))
-    print(SEP)
-    print(f"Média F1 ZD Híbrido   : {df_r['Hybrid_F1_ZD'].mean():.4f}")
-    print(f"Média F1 ZD Baseline  : {df_r['Baseline_F1_ZD'].mean():.4f}")
-    print(f"Delta médio ZD        : {df_r['Delta_F1_ZD'].mean():+.4f}")
-    print(f"Latência híbrido      : {df_r['Hybrid_Latency_us'].mean():.1f} µs/sample")
-    print(f"Taxa de auto-rotulação: {df_r['AutoLabel_AcceptRate'].mean():.1%}")
-    print(SEP)
+        print(f"\n{SEP}\nRESUMO FINAL\n{SEP}\n{df_r.to_string(index=False)}\n{SEP}")
+        print(
+            f"Média F1 Híbrido: {df_r['Hybrid_F1'].mean():.4f} | "
+            f"Delta: {df_r['Delta_F1'].mean():+.4f}\n{SEP}"
+        )
+    else:
+        log("Nenhum resultado disponível")
