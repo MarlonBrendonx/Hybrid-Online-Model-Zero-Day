@@ -56,6 +56,7 @@ class ExperimentConfig:
 
     # ── Misc ──────────────────────────────────────────────────────────────
     expert_queue_size: int = 100
+    baseline_only: bool = False
 
     def resolve_workers(self) -> int:
         if self.n_workers > 0:
